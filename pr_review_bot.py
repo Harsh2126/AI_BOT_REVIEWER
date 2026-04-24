@@ -7,12 +7,13 @@ import os
 import json
 import re
 import sys
+import httpx
 from github import Github
-from groq import Groq
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 MAX_DIFF_CHARS = 50_000
 
 SYSTEM_PROMPT = """You are an expert code reviewer. Analyze the provided PR diff and return a JSON response with:
@@ -92,17 +93,24 @@ def post_review(pr, summary: str, inline_comments: list[dict]) -> None:
 
 # ── Groq helper ───────────────────────────────────────────────────────────────
 
-def review_diff_with_groq(client: Groq, diff: str) -> dict:
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
+def review_diff_with_groq(api_key: str, diff: str) -> dict:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "temperature": 0.3,
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Please review this PR diff:\n\n```diff\n{diff}\n```"},
         ],
-        temperature=0.3,
-    )
+    }
 
-    raw = response.choices[0].message.content.strip()
+    response = httpx.post(GROQ_API_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+
+    raw = response.json()["choices"][0]["message"]["content"].strip()
 
     if raw.startswith("```"):
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
@@ -119,7 +127,6 @@ def main():
     repo_name = os.environ["GITHUB_REPOSITORY"]
     pr_number = int(os.environ["PR_NUMBER"])
 
-    client = Groq(api_key=groq_key)
     gh = Github(github_token)
     repo = gh.get_repo(repo_name)
 
@@ -131,7 +138,7 @@ def main():
         sys.exit(0)
 
     print("🤖 Sending diff to Groq for review...")
-    result = review_diff_with_groq(client, diff)
+    result = review_diff_with_groq(groq_key, diff)
 
     summary = result.get("summary", "No summary provided.")
     inline_comments = result.get("inline_comments", [])
