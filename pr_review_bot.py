@@ -1,19 +1,20 @@
 """
 GitHub PR Code Review Bot
-Fetches PR diffs, reviews them with Gemini, and posts comments back to GitHub.
+Fetches PR diffs, reviews them with Groq, and posts comments back to GitHub.
 """
 
 import os
 import json
 import re
 import sys
+import httpx
 from github import Github
-import google.generativeai as genai
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-GEMINI_MODEL = "gemini-2.0-flash"
-MAX_DIFF_CHARS = 50_000  # Truncate very large diffs to stay within token limits
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+MAX_DIFF_CHARS = 50_000
 
 SYSTEM_PROMPT = """You are an expert code reviewer. Analyze the provided PR diff and return a JSON response with:
 1. An overall summary of the changes
@@ -38,14 +39,11 @@ Keep comments concise and actionable. Only flag real issues, not style preferenc
 # ── GitHub helpers ────────────────────────────────────────────────────────────
 
 def get_pr_diff(repo, pr_number: int) -> tuple[object, str]:
-    """Return (pr_object, unified_diff_string)."""
     pr = repo.get_pull(pr_number)
-    files = pr.get_files()
-
     diff_parts = []
     total_chars = 0
 
-    for f in files:
+    for f in pr.get_files():
         header = f"--- a/{f.filename}\n+++ b/{f.filename}\n"
         patch = f.patch or ""
         chunk = header + patch + "\n"
@@ -61,19 +59,7 @@ def get_pr_diff(repo, pr_number: int) -> tuple[object, str]:
 
 
 def post_review(pr, summary: str, inline_comments: list[dict]) -> None:
-    """Post a PR review with inline comments and a summary body."""
     review_comments = []
-
-    # Collect valid commit SHAs for each file to anchor inline comments
-    file_to_sha: dict[str, str] = {}
-    for f in pr.get_files():
-        if f.blob_url:
-            # blob_url: https://github.com/owner/repo/blob/<sha>/path
-            match = re.search(r"/blob/([a-f0-9]+)/", f.blob_url)
-            if match:
-                file_to_sha[f.filename] = match.group(1)
-
-    head_sha = pr.head.sha
 
     for item in inline_comments:
         path = item.get("path", "")
@@ -92,30 +78,40 @@ def post_review(pr, summary: str, inline_comments: list[dict]) -> None:
     try:
         pr.create_review(
             commit=pr.get_commits().reversed[0],
-            body=f"## 🤖 Gemini Code Review\n\n{summary}",
+            body=f"## 🤖 Groq Code Review\n\n{summary}",
             event="COMMENT",
             comments=review_comments,
         )
         print(f"✅ Posted review with {len(review_comments)} inline comment(s).")
     except Exception as e:
-        # Fallback: post summary as a plain PR comment if review creation fails
         print(f"⚠️  Inline review failed ({e}), falling back to issue comment.")
-        body_lines = [f"## 🤖 Gemini Code Review\n\n{summary}"]
+        body_lines = [f"## 🤖 Groq Code Review\n\n{summary}"]
         for c in inline_comments:
             body_lines.append(f"\n**`{c.get('path')}` line {c.get('line')}:** {c.get('comment')}")
         pr.create_issue_comment("\n".join(body_lines))
 
 
-# ── Gemini helper ────────────────────────────────────────────────────────────
+# ── Groq helper ───────────────────────────────────────────────────────────────
 
-def review_diff_with_gemini(diff: str) -> dict:
-    """Send diff to Gemini and return parsed JSON response."""
-    model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=SYSTEM_PROMPT)
-    response = model.generate_content(f"Please review this PR diff:\n\n```diff\n{diff}\n```")
+def review_diff_with_groq(api_key: str, diff: str) -> dict:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "temperature": 0.3,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Please review this PR diff:\n\n```diff\n{diff}\n```"},
+        ],
+    }
 
-    raw = response.text.strip()
+    response = httpx.post(GROQ_API_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
 
-    # Strip markdown code fences if Gemini wraps the JSON
+    raw = response.json()["choices"][0]["message"]["content"].strip()
+
     if raw.startswith("```"):
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
         raw = re.sub(r"\n?```$", "", raw)
@@ -127,11 +123,9 @@ def review_diff_with_gemini(diff: str) -> dict:
 
 def main():
     github_token = os.environ["GITHUB_TOKEN"]
-    gemini_key = os.environ["GEMINI_API_KEY"]
-    repo_name = os.environ["GITHUB_REPOSITORY"]          # "owner/repo"
+    groq_key = os.environ["GROQ_API_KEY"]
+    repo_name = os.environ["GITHUB_REPOSITORY"]
     pr_number = int(os.environ["PR_NUMBER"])
-
-    genai.configure(api_key=gemini_key)
 
     gh = Github(github_token)
     repo = gh.get_repo(repo_name)
@@ -143,8 +137,8 @@ def main():
         print("No diff found — skipping review.")
         sys.exit(0)
 
-    print("🤖 Sending diff to Gemini for review...")
-    result = review_diff_with_gemini(diff)
+    print("🤖 Sending diff to Groq for review...")
+    result = review_diff_with_groq(groq_key, diff)
 
     summary = result.get("summary", "No summary provided.")
     inline_comments = result.get("inline_comments", [])
